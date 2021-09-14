@@ -15,6 +15,7 @@ use deno_core::Resource;
 use deno_core::ResourceId;
 use deno_core::ZeroCopyBuf;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::io::AsyncRead;
@@ -114,18 +115,6 @@ impl Resource for TcpStreamResource {
   }
 }
 
-pub type TlsStreamResource = FullDuplexResource<tls::ReadHalf, tls::WriteHalf>;
-
-impl Resource for TlsStreamResource {
-  fn name(&self) -> Cow<str> {
-    "tlsStream".into()
-  }
-
-  fn close(self: Rc<Self>) {
-    self.cancel_read_ops();
-  }
-}
-
 #[cfg(unix)]
 pub type UnixStreamResource =
   FullDuplexResource<unix::OwnedReadHalf, unix::OwnedWriteHalf>;
@@ -159,6 +148,75 @@ impl Resource for UnixStreamResource {
 
   fn close(self: Rc<Self>) {
     self.cancel_read_ops();
+  }
+}
+
+#[derive(Debug)]
+pub struct TlsStreamResource {
+  rd: AsyncRefCell<tls::ReadHalf>,
+  wr: AsyncRefCell<tls::WriteHalf>,
+  handshake_done: Cell<bool>,
+  cancel_handle: CancelHandle, // Only read and handshake ops get canceled.
+}
+
+impl TlsStreamResource {
+  pub fn new((rd, wr): (tls::ReadHalf, tls::WriteHalf)) -> Self {
+    Self {
+      rd: rd.into(),
+      wr: wr.into(),
+      handshake_done: Cell::new(false),
+      cancel_handle: Default::default(),
+    }
+  }
+
+  pub fn into_inner(self) -> (tls::ReadHalf, tls::WriteHalf) {
+    (self.rd.into_inner(), self.wr.into_inner())
+  }
+
+  pub async fn read(
+    self: &Rc<Self>,
+    buf: &mut [u8],
+  ) -> Result<usize, AnyError> {
+    let mut rd = RcRef::map(self, |r| &r.rd).borrow_mut().await;
+    let cancel_handle = RcRef::map(self, |r| &r.cancel_handle);
+    let nread = rd.read(buf).try_or_cancel(cancel_handle).await?;
+    Ok(nread)
+  }
+
+  pub async fn write(self: &Rc<Self>, buf: &[u8]) -> Result<usize, AnyError> {
+    self.handshake().await?;
+    let mut wr = RcRef::map(self, |r| &r.wr).borrow_mut().await;
+    let nwritten = wr.write(buf).await?;
+    wr.flush().await?;
+    Ok(nwritten)
+  }
+
+  pub async fn shutdown(self: &Rc<Self>) -> Result<(), AnyError> {
+    self.handshake().await?;
+    let mut wr = RcRef::map(self, |r| &r.wr).borrow_mut().await;
+    wr.shutdown().await?;
+    Ok(())
+  }
+
+  pub async fn handshake(self: &Rc<Self>) -> Result<(), AnyError> {
+    eprintln!("self.handshake_done.get {:?}", self.handshake_done.get());
+    if !self.handshake_done.get() {
+      let mut wr = RcRef::map(self, |r| &r.wr).borrow_mut().await;
+      let cancel_handle = RcRef::map(self, |r| &r.cancel_handle);
+      wr.handshake().try_or_cancel(cancel_handle).await?;
+      self.handshake_done.set(true);
+    }
+    Ok(())
+  }
+}
+
+impl Resource for TlsStreamResource {
+  fn name(&self) -> Cow<str> {
+    "tlsStream".into()
+  }
+
+  fn close(self: Rc<Self>) {
+    self.cancel_handle.cancel();
   }
 }
 

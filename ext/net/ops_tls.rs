@@ -123,6 +123,7 @@ enum State {
   StreamClosed,
   TlsClosing,
   TlsClosed,
+  TlsError,
   TcpClosed,
 }
 
@@ -157,10 +158,6 @@ impl TlsStream {
     Self::new(tcp, tls)
   }
 
-  pub async fn handshake(&mut self) -> io::Result<()> {
-    poll_fn(|cx| self.inner_mut().poll_io(cx, Flow::Write)).await
-  }
-
   fn into_split(self) -> (ReadHalf, WriteHalf) {
     let shared = Shared::new(self);
     let rd = ReadHalf {
@@ -179,6 +176,14 @@ impl TlsStream {
 
   fn inner_mut(&mut self) -> &mut TlsStreamInner {
     self.0.as_mut().unwrap()
+  }
+
+  pub async fn handshake(&mut self) -> io::Result<()> {
+    poll_fn(|cx| self.inner_mut().poll_handshake(cx)).await
+  }
+
+  fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    self.inner_mut().poll_handshake(cx)
   }
 }
 
@@ -247,6 +252,14 @@ impl TlsStreamInner {
     flow: Flow,
   ) -> Poll<io::Result<()>> {
     loop {
+      eprintln!(
+        "{:?} {:?} | {:?} {:?} | {:?} ",
+        self.rd_state,
+        self.tls.wants_read(),
+        self.wr_state,
+        self.tls.wants_write(),
+        self.tls.is_handshaking()
+      );
       let wr_ready = loop {
         match self.wr_state {
           _ if self.tls.is_handshaking() && !self.tls.wants_write() => {
@@ -282,19 +295,22 @@ impl TlsStreamInner {
           _ => {}
         }
 
+        // Write ciphertext to the TCP socket.
+        let mut wrapped_tcp = ImplementWriteTrait(&mut self.tcp);
+        match self.tls.write_tls(&mut wrapped_tcp) {
+          Ok(0) => {}
+          Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+          Err(err) => return Poll::Ready(Err(err)),
+          Ok(n) => {
+            eprintln!("WX {:?}", n);
+            continue;
+          }
+        }
+
         // Poll whether there is space in the socket send buffer so we can flush
         // the remaining outgoing ciphertext.
         if self.tcp.poll_write_ready(cx)?.is_pending() {
           break false;
-        }
-
-        // Write ciphertext to the TCP socket.
-        let mut wrapped_tcp = ImplementWriteTrait(&mut self.tcp);
-        match self.tls.write_tls(&mut wrapped_tcp) {
-          Ok(0) => unreachable!(),
-          Ok(_) => {}
-          Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-          Err(err) => return Poll::Ready(Err(err)),
         }
       };
 
@@ -304,6 +320,7 @@ impl TlsStreamInner {
             let err = Error::new(ErrorKind::UnexpectedEof, "tls handshake eof");
             return Poll::Ready(Err(err));
           }
+          State::TlsError => {}
           _ if self.tls.is_handshaking() && !self.tls.wants_read() => {
             break true;
           }
@@ -343,22 +360,35 @@ impl TlsStreamInner {
           }
         }
 
-        // Poll whether more ciphertext is available in the socket receive
-        // buffer.
-        if self.tcp.poll_read_ready(cx)?.is_pending() {
-          break false;
+        if self.rd_state != State::TlsError {
+          // Receive ciphertext from the socket.
+          let mut wrapped_tcp = ImplementReadTrait(&mut self.tcp);
+          match self.tls.read_tls(&mut wrapped_tcp) {
+            Ok(0) => {
+              self.rd_state = State::TcpClosed;
+              continue;
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+              // Get notified when more ciphertext becomes available in the socket
+              // receive buffer.
+              if self.tcp.poll_read_ready(cx)?.is_pending() {
+                break false;
+              } else {
+                continue;
+              }
+            }
+            Err(err) => return Poll::Ready(Err(err)),
+            _ => {}
+          }
         }
 
-        // Receive ciphertext from the socket.
-        let mut wrapped_tcp = ImplementReadTrait(&mut self.tcp);
-        match self.tls.read_tls(&mut wrapped_tcp) {
-          Ok(0) => self.rd_state = State::TcpClosed,
-          Ok(_) => self
-            .tls
-            .process_new_packets()
-            .map_err(|err| Error::new(ErrorKind::InvalidData, err))?,
-          Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-          Err(err) => return Poll::Ready(Err(err)),
+        // Interpret and decrypt TLS protocol data.
+        match self.tls.process_new_packets() {
+          Ok(_) => assert!(self.rd_state < State::TcpClosed),
+          Err(err) => {
+            self.rd_state = State::TlsError;
+            return Poll::Ready(Err(Error::new(ErrorKind::InvalidData, err)));
+          }
         }
       };
 
@@ -384,6 +414,16 @@ impl TlsStreamInner {
         true => Poll::Ready(Ok(())),
       };
     }
+  }
+
+  fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    if self.tls.is_handshaking() {
+      let r = self.poll_io(cx, Flow::Write);
+      eprintln!("is_handshaking and {:?}", r);
+      ready!(r)?;
+      //ready!(self.poll_io(cx, Flow::Write))?;
+    }
+    Poll::Ready(Ok(()))
   }
 
   fn poll_read(
@@ -503,6 +543,19 @@ impl AsyncRead for ReadHalf {
 #[derive(Debug)]
 pub struct WriteHalf {
   shared: Arc<Shared>,
+}
+
+impl WriteHalf {
+  pub async fn handshake(&mut self) -> io::Result<()> {
+    poll_fn(|cx| {
+      self
+        .shared
+        .poll_with_shared_waker(cx, Flow::Write, |mut tls, cx| {
+          tls.poll_handshake(cx)
+        })
+    })
+    .await
+  }
 }
 
 impl AsyncWrite for WriteHalf {
@@ -625,7 +678,11 @@ struct ImplementWriteTrait<'a, T>(&'a mut T);
 
 impl Write for ImplementWriteTrait<'_, TcpStream> {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    self.0.try_write(buf)
+    match self.0.try_write(buf) {
+      Ok(n) => Ok(n),
+      Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(0),
+      Err(err) => Err(err),
+    }
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -639,6 +696,7 @@ pub fn init<P: NetPermissions + 'static>() -> Vec<OpPair> {
     ("op_connect_tls", op_async(op_connect_tls::<P>)),
     ("op_listen_tls", op_sync(op_listen_tls::<P>)),
     ("op_accept_tls", op_async(op_accept_tls)),
+    ("op_tls_handshake", op_async(op_tls_handshake)),
   ]
 }
 
@@ -1014,4 +1072,16 @@ async fn op_accept_tls(
       port: remote_addr.port(),
     })),
   })
+}
+
+async fn op_tls_handshake(
+  state: Rc<RefCell<OpState>>,
+  rid: ResourceId,
+  _: (),
+) -> Result<(), AnyError> {
+  let resource = state
+    .borrow()
+    .resource_table
+    .get::<TlsStreamResource>(rid)?;
+  resource.handshake().await
 }
