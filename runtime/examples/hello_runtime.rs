@@ -64,6 +64,7 @@ async fn main() -> Result<(), AnyError> {
     permissions,
     options,
   );
+  // How do I set stdin here?
   worker.execute_main_module(&main_module).await?;
   worker.run_event_loop(false).await?;
   Ok(())
